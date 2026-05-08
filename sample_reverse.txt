@@ -1,0 +1,823 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SMART-PANEL-MFG.
+       AUTHOR.     M365-COPILOT.
+       DATE-WRITTEN. 2026-04-13.
+       REMARKS.
+      *  Manufacturing + Electrical complexity demo (>=200 lines).
+      *  NOTE: This is a standalone, in-memory demo program intended
+      *  for learning and test data generation.
+      *
+      *  What it models:
+      *   - Work Orders (WO) for LT panel manufacturing (MCC/PCC/DB)
+      *   - Feeder/Load schedule entry (motors, static loads, heaters)
+      *   - Electrical engineering calculations:
+      *       kW->kVA, current, starting current estimate,
+      *       ambient + altitude derating, cable sizing, breaker sizing,
+      *       busbar sizing margin.
+      *   - Manufacturing QA checklist scoring + NCR flag.
+      *   - BOM generation rules for panel base + feeders.
+      *   - Printable reports.
+
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SOURCE-COMPUTER. IBM-370.
+       OBJECT-COMPUTER. IBM-370.
+
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+
+      *------------------------------
+      *  Menu / control
+      *------------------------------
+       77  WS-MENU-CHOICE             PIC 99        VALUE 0.
+       77  WS-EXIT-FLAG               PIC X         VALUE 'N'.
+       77  WS-FOUND                   PIC X         VALUE 'N'.
+
+      *------------------------------
+      *  Counters
+      *------------------------------
+       77  WS-WO-COUNT                PIC 9(4)      VALUE 0.
+       77  WS-ITEM-COUNT              PIC 9(4)      VALUE 0.
+       77  WS-BOM-COUNT               PIC 9(4)      VALUE 0.
+
+      *------------------------------
+      *  Indexes
+      *------------------------------
+       77  WS-I                        PIC 9(4)     VALUE 0.
+       77  WS-J                        PIC 9(4)     VALUE 0.
+       77  WS-WO-IDX                   PIC 9(4)     VALUE 0.
+
+      *------------------------------
+      *  Temp calculation fields
+      *------------------------------
+       77  WS-SQRT3                    PIC 9V9999   VALUE 1.7320.
+       77  WS-DESIGN-MARGIN            PIC 9V99     VALUE 1.25.
+       77  WS-START-MULT-DOL           PIC 9V99     VALUE 6.00.
+       77  WS-START-MULT-STARDELTA     PIC 9V99     VALUE 2.50.
+       77  WS-START-MULT-VFD           PIC 9V99     VALUE 1.20.
+       77  WS-MIN-PF                   PIC 9V99     VALUE 0.70.
+
+       77  WS-RATED-VOLT               PIC 9(5)     VALUE 415.
+       77  WS-PHASE                    PIC 9        VALUE 3.
+       77  WS-AMBIENT                  PIC 99       VALUE 40.
+       77  WS-ALTITUDE                 PIC 9(5)     VALUE 0.
+       77  WS-DERATE                   PIC 9V99     VALUE 1.00.
+
+       77  WS-KW                       PIC 9(7)V99  VALUE 0.
+       77  WS-PF                       PIC 9V99     VALUE 0.
+       77  WS-KVA                      PIC 9(7)V99  VALUE 0.
+       77  WS-AMP                      PIC 9(7)V999 VALUE 0.
+       77  WS-AMP-DER                  PIC 9(7)V999 VALUE 0.
+       77  WS-AMP-PEAK                 PIC 9(7)V999 VALUE 0.
+
+       77  WS-TOTAL-KW                 PIC 9(9)V99  VALUE 0.
+       77  WS-TOTAL-KVA                PIC 9(9)V99  VALUE 0.
+       77  WS-TOTAL-AMP                PIC 9(9)V999 VALUE 0.
+       77  WS-BUSBAR-AMP               PIC 9(5)     VALUE 0.
+
+       77  WS-SELECTED-CABLE           PIC 9(4)     VALUE 0.
+       77  WS-SELECTED-BREAKER         PIC 9(5)     VALUE 0.
+
+      *------------------------------
+      *  QA
+      *------------------------------
+       77  WS-QA-SCORE                 PIC 9(3)     VALUE 0.
+       77  WS-QA-PASS                  PIC X        VALUE 'N'.
+       77  WS-NCR-FLAG                 PIC X        VALUE 'N'.
+       77  WS-ANS                      PIC X        VALUE 'N'.
+       77  WS-PROMPT                   PIC X(60)    VALUE SPACES.
+
+      *------------------------------
+      *  BOM temp fields
+      *------------------------------
+       77  WS-BM-PARTNO                PIC X(15)    VALUE SPACES.
+       77  WS-BM-PARTNAME              PIC X(35)    VALUE SPACES.
+       77  WS-BM-UOM                   PIC X(4)     VALUE SPACES.
+       77  WS-BM-QTY                   PIC 9(6)V99  VALUE 0.
+       77  WS-BM-CLASS                 PIC X(12)    VALUE SPACES.
+
+      *------------------------------
+      *  Input fields
+      *------------------------------
+       01  IN-WO.
+           05  IN-WO-ID                PIC X(12).
+           05  IN-CUSTOMER             PIC X(30).
+           05  IN-PANEL-TYPE           PIC X(20).
+           05  IN-VOLT                 PIC 9(5).
+           05  IN-PHASE                PIC 9.
+           05  IN-FREQ                 PIC 99.
+           05  IN-IP                   PIC X(6).
+           05  IN-FORM                 PIC X(10).
+           05  IN-AMBIENT              PIC 99.
+           05  IN-ALTITUDE             PIC 9(5).
+
+       01  IN-ITEM.
+           05  IN-FEEDER-ID            PIC X(8).
+           05  IN-DESC                 PIC X(30).
+           05  IN-LOAD-TYPE            PIC X(12).
+           05  IN-KW                   PIC 9(7)V99.
+           05  IN-PF                   PIC 9V99.
+           05  IN-DUTY                 PIC X(8).
+           05  IN-STARTING             PIC X(10).
+           05  IN-QTY                  PIC 9(3).
+
+      *------------------------------
+      *  Work Order table
+      *------------------------------
+       01  WO-TABLE.
+           05  WO-ENTRY OCCURS 200 TIMES.
+               10  WO-ID               PIC X(12).
+               10  WO-CUSTOMER         PIC X(30).
+               10  WO-PANEL-TYPE       PIC X(20).
+               10  WO-RATED-VOLT       PIC 9(5).
+               10  WO-PHASE            PIC 9.
+               10  WO-FREQUENCY        PIC 99.
+               10  WO-IP-RATING        PIC X(6).
+               10  WO-FORM             PIC X(10).
+               10  WO-AMBIENT          PIC 99.
+               10  WO-ALTITUDE         PIC 9(5).
+               10  WO-STATUS           PIC X(12).
+
+      *------------------------------
+      *  Feeder / Load schedule table
+      *------------------------------
+       01  ITEM-TABLE.
+           05  ITEM-ENTRY OCCURS 1000 TIMES.
+               10  IT-WO-ID            PIC X(12).
+               10  IT-FEEDER-ID        PIC X(8).
+               10  IT-DESCRIPTION      PIC X(30).
+               10  IT-LOAD-TYPE        PIC X(12).
+               10  IT-KW               PIC 9(7)V99.
+               10  IT-PF               PIC 9V99.
+               10  IT-DUTY             PIC X(8).
+               10  IT-STARTING         PIC X(10).
+               10  IT-QUANTITY         PIC 9(3).
+               10  IT-KVA              PIC 9(7)V99.
+               10  IT-AMP              PIC 9(7)V999.
+               10  IT-AMP-PEAK         PIC 9(7)V999.
+               10  IT-CABLE-SQMM       PIC 9(4).
+               10  IT-BREAKER-AMP      PIC 9(5).
+               10  IT-NOTE             PIC X(30).
+
+      *------------------------------
+      *  BOM table
+      *------------------------------
+       01  BOM-TABLE.
+           05  BOM-ENTRY OCCURS 2000 TIMES.
+               10  BM-WO-ID            PIC X(12).
+               10  BM-PART-NO          PIC X(15).
+               10  BM-PART-NAME        PIC X(35).
+               10  BM-UOM              PIC X(4).
+               10  BM-QTY              PIC 9(6)V99.
+               10  BM-CLASS            PIC X(12).
+
+      *------------------------------
+      *  Standard breaker ratings
+      *------------------------------
+       01  STD-BREAKER-RATINGS.
+           05  STD-BKR OCCURS 16 TIMES PIC 9(5)
+               VALUE 10, 16, 20, 25, 32, 40, 50, 63,
+                     80, 100, 125, 160, 200, 250, 320, 400.
+
+      *------------------------------
+      *  Cable sizing (sqmm -> ampacity)
+      *  (Simplified for demo, single-core Cu in tray)
+      *------------------------------
+       01  STD-CABLE.
+           05  STD-CAB OCCURS 12 TIMES.
+               10  STD-SQMM            PIC 9(4)
+                   VALUE 1, 2, 4, 6, 10, 16, 25, 35, 50, 70, 95, 120.
+               10  STD-AMP             PIC 9(5)
+                   VALUE 11, 19, 27, 36, 50, 68, 89, 110, 140, 175, 210, 245.
+
+       PROCEDURE DIVISION.
+
+       MAIN.
+           PERFORM SEED-DATA
+           PERFORM UNTIL WS-EXIT-FLAG = 'Y'
+               PERFORM SHOW-MENU
+               PERFORM READ-MENU
+               EVALUATE WS-MENU-CHOICE
+                   WHEN 1
+                       PERFORM CREATE-WO
+                   WHEN 2
+                       PERFORM ADD-FEEDER-ITEM
+                   WHEN 3
+                       PERFORM RUN-ELECTRICAL-CALCS
+                   WHEN 4
+                       PERFORM GENERATE-BOM
+                   WHEN 5
+                       PERFORM QA-CHECKLIST
+                   WHEN 6
+                       PERFORM PRINT-REPORTS
+                   WHEN 9
+                       MOVE 'Y' TO WS-EXIT-FLAG
+                   WHEN OTHER
+                       DISPLAY "Invalid option."
+               END-EVALUATE
+           END-PERFORM
+           DISPLAY "Program ended."
+           STOP RUN.
+
+      *=================================================
+      *  MENU
+      *=================================================
+       SHOW-MENU.
+           DISPLAY " "
+           DISPLAY "========== SMART PANEL MFG =========="
+           DISPLAY "1. Create Work Order"
+           DISPLAY "2. Add Feeder/Load Item"
+           DISPLAY "3. Run Electrical Calculations"
+           DISPLAY "4. Generate BOM (components)"
+           DISPLAY "5. QA Checklist + NCR"
+           DISPLAY "6. Print Reports"
+           DISPLAY "9. Exit"
+           DISPLAY "====================================".
+
+       READ-MENU.
+           MOVE 0 TO WS-MENU-CHOICE
+           DISPLAY "Enter choice: "
+           ACCEPT WS-MENU-CHOICE.
+
+      *=================================================
+      *  SEED DATA
+      *=================================================
+       SEED-DATA.
+           PERFORM SEED-WO
+           PERFORM SEED-ITEMS.
+
+       SEED-WO.
+           ADD 1 TO WS-WO-COUNT
+           MOVE "WO-000000001"          TO WO-ID(WS-WO-COUNT)
+           MOVE "DEMO-CUSTOMER"         TO WO-CUSTOMER(WS-WO-COUNT)
+           MOVE "MCC"                   TO WO-PANEL-TYPE(WS-WO-COUNT)
+           MOVE 415                     TO WO-RATED-VOLT(WS-WO-COUNT)
+           MOVE 3                       TO WO-PHASE(WS-WO-COUNT)
+           MOVE 50                      TO WO-FREQUENCY(WS-WO-COUNT)
+           MOVE "IP54"                  TO WO-IP-RATING(WS-WO-COUNT)
+           MOVE "FORM-3B"               TO WO-FORM(WS-WO-COUNT)
+           MOVE 40                      TO WO-AMBIENT(WS-WO-COUNT)
+           MOVE 600                     TO WO-ALTITUDE(WS-WO-COUNT)
+           MOVE "NEW"                   TO WO-STATUS(WS-WO-COUNT).
+
+       SEED-ITEMS.
+      *  Seed by filling IN-ITEM fields and performing ADD-ITEM.
+           MOVE "WO-000000001" TO IN-WO-ID
+
+           MOVE "FDR-0001" TO IN-FEEDER-ID
+           MOVE "PUMP MOTOR" TO IN-DESC
+           MOVE "MOTOR" TO IN-LOAD-TYPE
+           MOVE 7.50 TO IN-KW
+           MOVE 0.85 TO IN-PF
+           MOVE "CONT" TO IN-DUTY
+           MOVE "DOL" TO IN-STARTING
+           MOVE 1 TO IN-QTY
+           PERFORM ADD-ITEM-INTERNAL
+
+           MOVE "FDR-0002" TO IN-FEEDER-ID
+           MOVE "CONVEYOR" TO IN-DESC
+           MOVE "MOTOR" TO IN-LOAD-TYPE
+           MOVE 5.50 TO IN-KW
+           MOVE 0.82 TO IN-PF
+           MOVE "CONT" TO IN-DUTY
+           MOVE "VFD" TO IN-STARTING
+           MOVE 1 TO IN-QTY
+           PERFORM ADD-ITEM-INTERNAL
+
+           MOVE "FDR-0003" TO IN-FEEDER-ID
+           MOVE "LIGHTING" TO IN-DESC
+           MOVE "STATIC" TO IN-LOAD-TYPE
+           MOVE 2.00 TO IN-KW
+           MOVE 0.95 TO IN-PF
+           MOVE "INT" TO IN-DUTY
+           MOVE "NA" TO IN-STARTING
+           MOVE 1 TO IN-QTY
+           PERFORM ADD-ITEM-INTERNAL.
+
+      *=================================================
+      *  CREATE WORK ORDER
+      *=================================================
+       CREATE-WO.
+           IF WS-WO-COUNT >= 200
+               DISPLAY "WO limit reached."
+               EXIT PARAGRAPH
+           END-IF
+
+           DISPLAY "Enter WO ID (12 chars): "
+           ACCEPT IN-WO-ID
+           PERFORM FIND-WO
+           IF WS-FOUND = 'Y'
+               DISPLAY "WO already exists."
+               EXIT PARAGRAPH
+           END-IF
+
+           DISPLAY "Customer: "
+           ACCEPT IN-CUSTOMER
+           DISPLAY "Panel type (MCC/PCC/DB/UPS): "
+           ACCEPT IN-PANEL-TYPE
+           DISPLAY "Rated Voltage (e.g., 415): "
+           ACCEPT IN-VOLT
+           DISPLAY "Phase (1/3): "
+           ACCEPT IN-PHASE
+           DISPLAY "Frequency (50/60): "
+           ACCEPT IN-FREQ
+           DISPLAY "IP rating (IP54): "
+           ACCEPT IN-IP
+           DISPLAY "Form (FORM-2/3B/4): "
+           ACCEPT IN-FORM
+           DISPLAY "Ambient (C): "
+           ACCEPT IN-AMBIENT
+           DISPLAY "Altitude (m): "
+           ACCEPT IN-ALTITUDE
+
+           ADD 1 TO WS-WO-COUNT
+           MOVE IN-WO-ID        TO WO-ID(WS-WO-COUNT)
+           MOVE IN-CUSTOMER     TO WO-CUSTOMER(WS-WO-COUNT)
+           MOVE IN-PANEL-TYPE   TO WO-PANEL-TYPE(WS-WO-COUNT)
+           MOVE IN-VOLT         TO WO-RATED-VOLT(WS-WO-COUNT)
+           MOVE IN-PHASE        TO WO-PHASE(WS-WO-COUNT)
+           MOVE IN-FREQ         TO WO-FREQUENCY(WS-WO-COUNT)
+           MOVE IN-IP           TO WO-IP-RATING(WS-WO-COUNT)
+           MOVE IN-FORM         TO WO-FORM(WS-WO-COUNT)
+           MOVE IN-AMBIENT      TO WO-AMBIENT(WS-WO-COUNT)
+           MOVE IN-ALTITUDE     TO WO-ALTITUDE(WS-WO-COUNT)
+           MOVE "NEW"          TO WO-STATUS(WS-WO-COUNT)
+
+           DISPLAY "WO created: " IN-WO-ID.
+
+      *=================================================
+      *  ADD FEEDER ITEM
+      *=================================================
+       ADD-FEEDER-ITEM.
+           DISPLAY "Enter WO ID: "
+           ACCEPT IN-WO-ID
+           PERFORM FIND-WO
+           IF WS-FOUND NOT = 'Y'
+               DISPLAY "WO not found."
+               EXIT PARAGRAPH
+           END-IF
+           IF WS-ITEM-COUNT >= 1000
+               DISPLAY "Item limit reached."
+               EXIT PARAGRAPH
+           END-IF
+
+           DISPLAY "Feeder ID (FDR-0001): "
+           ACCEPT IN-FEEDER-ID
+           DISPLAY "Description: "
+           ACCEPT IN-DESC
+           DISPLAY "Load type (MOTOR/STATIC/HEATER): "
+           ACCEPT IN-LOAD-TYPE
+           DISPLAY "kW (e.g., 7.50): "
+           ACCEPT IN-KW
+           DISPLAY "Power factor (0.70-0.99): "
+           ACCEPT IN-PF
+           DISPLAY "Duty (CONT/INT): "
+           ACCEPT IN-DUTY
+           DISPLAY "Starting (DOL/VFD/STARDELTA/NA): "
+           ACCEPT IN-STARTING
+           DISPLAY "Quantity: "
+           ACCEPT IN-QTY
+
+           PERFORM ADD-ITEM-INTERNAL
+           DISPLAY "Item added.".
+
+       ADD-ITEM-INTERNAL.
+           ADD 1 TO WS-ITEM-COUNT
+           MOVE IN-WO-ID         TO IT-WO-ID(WS-ITEM-COUNT)
+           MOVE IN-FEEDER-ID     TO IT-FEEDER-ID(WS-ITEM-COUNT)
+           MOVE IN-DESC          TO IT-DESCRIPTION(WS-ITEM-COUNT)
+           MOVE IN-LOAD-TYPE     TO IT-LOAD-TYPE(WS-ITEM-COUNT)
+           MOVE IN-KW            TO IT-KW(WS-ITEM-COUNT)
+           MOVE IN-PF            TO IT-PF(WS-ITEM-COUNT)
+           MOVE IN-DUTY          TO IT-DUTY(WS-ITEM-COUNT)
+           MOVE IN-STARTING      TO IT-STARTING(WS-ITEM-COUNT)
+           MOVE IN-QTY           TO IT-QUANTITY(WS-ITEM-COUNT)
+           MOVE 0                TO IT-KVA(WS-ITEM-COUNT)
+           MOVE 0                TO IT-AMP(WS-ITEM-COUNT)
+           MOVE 0                TO IT-AMP-PEAK(WS-ITEM-COUNT)
+           MOVE 0                TO IT-CABLE-SQMM(WS-ITEM-COUNT)
+           MOVE 0                TO IT-BREAKER-AMP(WS-ITEM-COUNT)
+           MOVE SPACES           TO IT-NOTE(WS-ITEM-COUNT).
+
+      *=================================================
+      *  FIND WO
+      *=================================================
+       FIND-WO.
+           MOVE 'N' TO WS-FOUND
+           MOVE 0   TO WS-WO-IDX
+           PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > WS-WO-COUNT
+               IF WO-ID(WS-I) = IN-WO-ID
+                   MOVE 'Y' TO WS-FOUND
+                   MOVE WS-I TO WS-WO-IDX
+                   EXIT PERFORM
+               END-IF
+           END-PERFORM.
+
+      *=================================================
+      *  ELECTRICAL CALCULATIONS
+      *=================================================
+       RUN-ELECTRICAL-CALCS.
+           DISPLAY "Enter WO ID for calculations: "
+           ACCEPT IN-WO-ID
+           PERFORM FIND-WO
+           IF WS-FOUND NOT = 'Y'
+               DISPLAY "WO not found."
+               EXIT PARAGRAPH
+           END-IF
+
+           MOVE WO-RATED-VOLT(WS-WO-IDX) TO WS-RATED-VOLT
+           MOVE WO-PHASE(WS-WO-IDX)      TO WS-PHASE
+           MOVE WO-AMBIENT(WS-WO-IDX)    TO WS-AMBIENT
+           MOVE WO-ALTITUDE(WS-WO-IDX)   TO WS-ALTITUDE
+
+           PERFORM COMPUTE-DERATING
+
+           PERFORM VARYING WS-J FROM 1 BY 1 UNTIL WS-J > WS-ITEM-COUNT
+               IF IT-WO-ID(WS-J) = IN-WO-ID
+                   PERFORM CALC-ONE-ITEM
+               END-IF
+           END-PERFORM
+
+           MOVE "CALCULATED" TO WO-STATUS(WS-WO-IDX)
+           DISPLAY "Electrical calculations completed.".
+
+       COMPUTE-DERATING.
+      *  Simplified derating factors:
+      *   Ambient > 40C : 0.95; > 50C : 0.90
+      *   Altitude > 1000m : *0.97; > 2000m : *0.94
+           MOVE 1.00 TO WS-DERATE
+           IF WS-AMBIENT > 50
+               MOVE 0.90 TO WS-DERATE
+           ELSE
+               IF WS-AMBIENT > 40
+                   MOVE 0.95 TO WS-DERATE
+               END-IF
+           END-IF
+
+           IF WS-ALTITUDE > 2000
+               COMPUTE WS-DERATE = WS-DERATE * 0.94
+           ELSE
+               IF WS-ALTITUDE > 1000
+                   COMPUTE WS-DERATE = WS-DERATE * 0.97
+               END-IF
+           END-IF.
+
+       CALC-ONE-ITEM.
+      *  Uses WS-J as current item index
+           MOVE IT-KW(WS-J) TO WS-KW
+           MOVE IT-PF(WS-J) TO WS-PF
+
+           IF WS-PF < WS-MIN-PF
+               MOVE WS-MIN-PF TO WS-PF
+               MOVE "PF CLAMPED" TO IT-NOTE(WS-J)
+           END-IF
+
+           COMPUTE WS-KVA = WS-KW / WS-PF
+
+           IF WS-PHASE = 3
+               COMPUTE WS-AMP = (WS-KVA * 1000) / (WS-SQRT3 * WS-RATED-VOLT)
+           ELSE
+               COMPUTE WS-AMP = (WS-KVA * 1000) / WS-RATED-VOLT
+           END-IF
+
+      *  Apply quantity
+           COMPUTE WS-AMP = WS-AMP * IT-QUANTITY(WS-J)
+
+      *  Apply design margin and derating
+           COMPUTE WS-AMP-DER = (WS-AMP * WS-DESIGN-MARGIN) / WS-DERATE
+
+      *  Starting current estimate
+           MOVE WS-AMP-DER TO WS-AMP-PEAK
+           IF IT-LOAD-TYPE(WS-J) = "MOTOR"
+               EVALUATE IT-STARTING(WS-J)
+                   WHEN "DOL"
+                       COMPUTE WS-AMP-PEAK = WS-AMP-DER * WS-START-MULT-DOL
+                   WHEN "STARDELTA"
+                       COMPUTE WS-AMP-PEAK = WS-AMP-DER * WS-START-MULT-STARDELTA
+                   WHEN "VFD"
+                       COMPUTE WS-AMP-PEAK = WS-AMP-DER * WS-START-MULT-VFD
+                   WHEN OTHER
+                       CONTINUE
+               END-EVALUATE
+           END-IF
+
+           MOVE WS-KVA      TO IT-KVA(WS-J)
+           MOVE WS-AMP-DER  TO IT-AMP(WS-J)
+           MOVE WS-AMP-PEAK TO IT-AMP-PEAK(WS-J)
+
+           PERFORM SELECT-CABLE
+           PERFORM SELECT-BREAKER.
+
+       SELECT-CABLE.
+      *  pick first cable with ampacity >= WS-AMP-DER
+           MOVE 0 TO WS-SELECTED-CABLE
+           PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > 12
+               IF WS-AMP-DER <= STD-AMP(WS-I)
+                   MOVE STD-SQMM(WS-I) TO WS-SELECTED-CABLE
+                   EXIT PERFORM
+               END-IF
+           END-PERFORM
+
+           IF WS-SELECTED-CABLE = 0
+               MOVE 120 TO WS-SELECTED-CABLE
+               MOVE "CAB MAX" TO IT-NOTE(WS-J)
+           END-IF
+
+           MOVE WS-SELECTED-CABLE TO IT-CABLE-SQMM(WS-J).
+
+       SELECT-BREAKER.
+      *  pick next standard rating >= WS-AMP-DER
+           MOVE 0 TO WS-SELECTED-BREAKER
+           PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > 16
+               IF WS-AMP-DER <= STD-BKR(WS-I)
+                   MOVE STD-BKR(WS-I) TO WS-SELECTED-BREAKER
+                   EXIT PERFORM
+               END-IF
+           END-PERFORM
+
+           IF WS-SELECTED-BREAKER = 0
+               MOVE 400 TO WS-SELECTED-BREAKER
+               MOVE "BKR MAX" TO IT-NOTE(WS-J)
+           END-IF
+
+           MOVE WS-SELECTED-BREAKER TO IT-BREAKER-AMP(WS-J).
+
+      *=================================================
+      *  BOM GENERATION
+      *=================================================
+       GENERATE-BOM.
+           DISPLAY "Enter WO ID for BOM: "
+           ACCEPT IN-WO-ID
+           PERFORM FIND-WO
+           IF WS-FOUND NOT = 'Y'
+               DISPLAY "WO not found."
+               EXIT PARAGRAPH
+           END-IF
+
+           PERFORM BOM-ADD-PANEL-BASE
+
+           PERFORM VARYING WS-J FROM 1 BY 1 UNTIL WS-J > WS-ITEM-COUNT
+               IF IT-WO-ID(WS-J) = IN-WO-ID
+                   PERFORM BOM-ADD-FEEDER
+               END-IF
+           END-PERFORM
+
+           MOVE "BOM-GEN" TO WO-STATUS(WS-WO-IDX)
+           DISPLAY "BOM generated (appended).".
+
+       BOM-ADD-PANEL-BASE.
+           MOVE "ENCL-415-IP"      TO WS-BM-PARTNO
+           MOVE "Enclosure 415V IP" TO WS-BM-PARTNAME
+           MOVE "EA"              TO WS-BM-UOM
+           MOVE 1.00              TO WS-BM-QTY
+           MOVE "MECH"            TO WS-BM-CLASS
+           PERFORM BOM-ADD
+
+           MOVE "BB-CU-100"       TO WS-BM-PARTNO
+           MOVE "Copper Busbar Set" TO WS-BM-PARTNAME
+           MOVE "SET"            TO WS-BM-UOM
+           MOVE 1.00             TO WS-BM-QTY
+           MOVE "ELEC"           TO WS-BM-CLASS
+           PERFORM BOM-ADD
+
+           MOVE "INCOMER-250"     TO WS-BM-PARTNO
+           MOVE "Incomer MCCB 250A" TO WS-BM-PARTNAME
+           MOVE "EA"             TO WS-BM-UOM
+           MOVE 1.00             TO WS-BM-QTY
+           MOVE "ELEC"           TO WS-BM-CLASS
+           PERFORM BOM-ADD
+
+           MOVE "METER-3PH"       TO WS-BM-PARTNO
+           MOVE "3Ph Multifunction Meter" TO WS-BM-PARTNAME
+           MOVE "EA"             TO WS-BM-UOM
+           MOVE 1.00             TO WS-BM-QTY
+           MOVE "ELEC"           TO WS-BM-CLASS
+           PERFORM BOM-ADD
+
+           MOVE "LABEL-KIT"       TO WS-BM-PARTNO
+           MOVE "Ferrules + Labels" TO WS-BM-PARTNAME
+           MOVE "SET"            TO WS-BM-UOM
+           MOVE 1.00             TO WS-BM-QTY
+           MOVE "QA"             TO WS-BM-CLASS
+           PERFORM BOM-ADD.
+
+       BOM-ADD-FEEDER.
+      *  Uses WS-J as current feeder item.
+           IF IT-BREAKER-AMP(WS-J) <= 63
+               MOVE "MCB-63"       TO WS-BM-PARTNO
+               MOVE "MCB 6-63A"    TO WS-BM-PARTNAME
+               MOVE "EA"          TO WS-BM-UOM
+               MOVE 1.00          TO WS-BM-QTY
+               MOVE "ELEC"        TO WS-BM-CLASS
+               PERFORM BOM-ADD
+           ELSE
+               MOVE "MCCB-400"     TO WS-BM-PARTNO
+               MOVE "MCCB 80-400A" TO WS-BM-PARTNAME
+               MOVE "EA"          TO WS-BM-UOM
+               MOVE 1.00          TO WS-BM-QTY
+               MOVE "ELEC"        TO WS-BM-CLASS
+               PERFORM BOM-ADD
+           END-IF
+
+           IF IT-LOAD-TYPE(WS-J) = "MOTOR"
+               IF IT-STARTING(WS-J) = "VFD"
+                   MOVE "VFD-GEN"            TO WS-BM-PARTNO
+                   MOVE "VFD Drive (generic)" TO WS-BM-PARTNAME
+                   MOVE "EA"                TO WS-BM-UOM
+                   MOVE 1.00                TO WS-BM-QTY
+                   MOVE "ELEC"              TO WS-BM-CLASS
+                   PERFORM BOM-ADD
+               ELSE
+                   MOVE "CONT-AC3"           TO WS-BM-PARTNO
+                   MOVE "Contactor AC3"      TO WS-BM-PARTNAME
+                   MOVE "EA"                TO WS-BM-UOM
+                   MOVE 1.00                TO WS-BM-QTY
+                   MOVE "ELEC"              TO WS-BM-CLASS
+                   PERFORM BOM-ADD
+
+                   MOVE "OLR-ADJ"            TO WS-BM-PARTNO
+                   MOVE "Overload Relay Adj." TO WS-BM-PARTNAME
+                   MOVE "EA"                TO WS-BM-UOM
+                   MOVE 1.00                TO WS-BM-QTY
+                   MOVE "ELEC"              TO WS-BM-CLASS
+                   PERFORM BOM-ADD
+               END-IF
+           ELSE
+               MOVE "AUX-SET"           TO WS-BM-PARTNO
+               MOVE "Aux Contact Set"   TO WS-BM-PARTNAME
+               MOVE "EA"               TO WS-BM-UOM
+               MOVE 1.00               TO WS-BM-QTY
+               MOVE "ELEC"             TO WS-BM-CLASS
+               PERFORM BOM-ADD
+           END-IF
+
+           MOVE "LUG-KIT"          TO WS-BM-PARTNO
+           MOVE "Cable Lugs Kit"   TO WS-BM-PARTNAME
+           MOVE "SET"             TO WS-BM-UOM
+           MOVE 1.00              TO WS-BM-QTY
+           MOVE "ELEC"            TO WS-BM-CLASS
+           PERFORM BOM-ADD
+
+           MOVE "DIN-RAIL"         TO WS-BM-PARTNO
+           MOVE "DIN Rail + End Stops" TO WS-BM-PARTNAME
+           MOVE "SET"             TO WS-BM-UOM
+           MOVE 1.00              TO WS-BM-QTY
+           MOVE "MECH"            TO WS-BM-CLASS
+           PERFORM BOM-ADD.
+
+       BOM-ADD.
+           IF WS-BOM-COUNT >= 2000
+               DISPLAY "BOM table full - cannot add more."
+               EXIT PARAGRAPH
+           END-IF
+
+           ADD 1 TO WS-BOM-COUNT
+           MOVE IN-WO-ID         TO BM-WO-ID(WS-BOM-COUNT)
+           MOVE WS-BM-PARTNO     TO BM-PART-NO(WS-BOM-COUNT)
+           MOVE WS-BM-PARTNAME   TO BM-PART-NAME(WS-BOM-COUNT)
+           MOVE WS-BM-UOM        TO BM-UOM(WS-BOM-COUNT)
+           MOVE WS-BM-QTY        TO BM-QTY(WS-BOM-COUNT)
+           MOVE WS-BM-CLASS      TO BM-CLASS(WS-BOM-COUNT).
+
+      *=================================================
+      *  QA CHECKLIST
+      *=================================================
+       QA-CHECKLIST.
+           DISPLAY "Enter WO ID for QA: "
+           ACCEPT IN-WO-ID
+           PERFORM FIND-WO
+           IF WS-FOUND NOT = 'Y'
+               DISPLAY "WO not found."
+               EXIT PARAGRAPH
+           END-IF
+
+           MOVE 0   TO WS-QA-SCORE
+           MOVE 'N' TO WS-QA-PASS
+           MOVE 'N' TO WS-NCR-FLAG
+
+           MOVE "Torque marks verified (Y/N): " TO WS-PROMPT
+           PERFORM QA-ASK
+           MOVE "Ferrules + crimps OK (Y/N): "  TO WS-PROMPT
+           PERFORM QA-ASK
+           MOVE "Wire dressing OK (Y/N): "      TO WS-PROMPT
+           PERFORM QA-ASK
+           MOVE "Clearance/creepage OK (Y/N): " TO WS-PROMPT
+           PERFORM QA-ASK
+           MOVE "Earth continuity OK (Y/N): "   TO WS-PROMPT
+           PERFORM QA-ASK
+           MOVE "Megger test OK (Y/N): "        TO WS-PROMPT
+           PERFORM QA-ASK
+           MOVE "Functional test OK (Y/N): "    TO WS-PROMPT
+           PERFORM QA-ASK
+           MOVE "Labels + SLD match OK (Y/N): " TO WS-PROMPT
+           PERFORM QA-ASK
+
+           IF WS-QA-SCORE >= 7
+               MOVE 'Y' TO WS-QA-PASS
+               MOVE "QA-PASS" TO WO-STATUS(WS-WO-IDX)
+               DISPLAY "QA PASS. Score: " WS-QA-SCORE
+           ELSE
+               MOVE 'N' TO WS-QA-PASS
+               MOVE 'Y' TO WS-NCR-FLAG
+               MOVE "NCR-OPEN" TO WO-STATUS(WS-WO-IDX)
+               DISPLAY "QA FAIL. Score: " WS-QA-SCORE
+               DISPLAY "NCR raised for rework."
+           END-IF.
+
+       QA-ASK.
+           DISPLAY WS-PROMPT
+           ACCEPT WS-ANS
+           IF WS-ANS = 'Y' OR WS-ANS = 'y'
+               ADD 1 TO WS-QA-SCORE
+           ELSE
+               MOVE 'Y' TO WS-NCR-FLAG
+           END-IF.
+
+      *=================================================
+      *  REPORTS
+      *=================================================
+       PRINT-REPORTS.
+           DISPLAY "Enter WO ID to print reports: "
+           ACCEPT IN-WO-ID
+           PERFORM FIND-WO
+           IF WS-FOUND NOT = 'Y'
+               DISPLAY "WO not found."
+               EXIT PARAGRAPH
+           END-IF
+
+           PERFORM REPORT-WO-HEADER
+           PERFORM REPORT-LOAD-SUMMARY
+           PERFORM REPORT-FEEDER-LIST
+           PERFORM REPORT-BOM
+           DISPLAY "End of reports.".
+
+       REPORT-WO-HEADER.
+           DISPLAY " "
+           DISPLAY "---- WORK ORDER HEADER ----"
+           DISPLAY "WO ID      : " WO-ID(WS-WO-IDX)
+           DISPLAY "CUSTOMER   : " WO-CUSTOMER(WS-WO-IDX)
+           DISPLAY "PANEL TYPE : " WO-PANEL-TYPE(WS-WO-IDX)
+           DISPLAY "VOLT/PH/Hz : " WO-RATED-VOLT(WS-WO-IDX)
+                   " / " WO-PHASE(WS-WO-IDX)
+                   " / " WO-FREQUENCY(WS-WO-IDX)
+           DISPLAY "IP/FORM    : " WO-IP-RATING(WS-WO-IDX)
+                   " / " WO-FORM(WS-WO-IDX)
+           DISPLAY "AMBIENT/ALT: " WO-AMBIENT(WS-WO-IDX)
+                   "C / " WO-ALTITUDE(WS-WO-IDX)
+           DISPLAY "STATUS     : " WO-STATUS(WS-WO-IDX)
+           DISPLAY "--------------------------".
+
+       REPORT-LOAD-SUMMARY.
+           MOVE 0 TO WS-TOTAL-KW
+           MOVE 0 TO WS-TOTAL-KVA
+           MOVE 0 TO WS-TOTAL-AMP
+
+           PERFORM VARYING WS-J FROM 1 BY 1 UNTIL WS-J > WS-ITEM-COUNT
+               IF IT-WO-ID(WS-J) = IN-WO-ID
+                   ADD IT-KW(WS-J)  TO WS-TOTAL-KW
+                   ADD IT-KVA(WS-J) TO WS-TOTAL-KVA
+                   ADD IT-AMP(WS-J) TO WS-TOTAL-AMP
+               END-IF
+           END-PERFORM
+
+           MOVE WS-TOTAL-AMP TO WS-BUSBAR-AMP
+           COMPUTE WS-BUSBAR-AMP = WS-BUSBAR-AMP * 1.20
+
+           DISPLAY "---- LOAD SUMMARY ----"
+           DISPLAY "Total kW     : " WS-TOTAL-KW
+           DISPLAY "Total kVA    : " WS-TOTAL-KVA
+           DISPLAY "Total Amps   : " WS-TOTAL-AMP
+           DISPLAY "Busbar Amps* : " WS-BUSBAR-AMP
+           DISPLAY "*Includes 20% margin".
+
+       REPORT-FEEDER-LIST.
+           DISPLAY "---- FEEDER LIST ----"
+           DISPLAY "FDR     DESC                          kW    PF   kVA    A(der)  Apeak  CAB  BKR NOTE"
+           PERFORM VARYING WS-J FROM 1 BY 1 UNTIL WS-J > WS-ITEM-COUNT
+               IF IT-WO-ID(WS-J) = IN-WO-ID
+                   DISPLAY IT-FEEDER-ID(WS-J) " "
+                           IT-DESCRIPTION(WS-J) " "
+                           IT-KW(WS-J) " " IT-PF(WS-J) " "
+                           IT-KVA(WS-J) " " IT-AMP(WS-J) " "
+                           IT-AMP-PEAK(WS-J) " "
+                           IT-CABLE-SQMM(WS-J) " " IT-BREAKER-AMP(WS-J)
+                           " " IT-NOTE(WS-J)
+               END-IF
+           END-PERFORM
+           DISPLAY "--------------------".
+
+       REPORT-BOM.
+           DISPLAY "---- BOM (FOR WO) ----"
+           DISPLAY "PART NO        PART NAME                          UOM   QTY    CLASS"
+           PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > WS-BOM-COUNT
+               IF BM-WO-ID(WS-I) = IN-WO-ID
+                   DISPLAY BM-PART-NO(WS-I) " "
+                           BM-PART-NAME(WS-I) " "
+                           BM-UOM(WS-I) " " BM-QTY(WS-I) " " BM-CLASS(WS-I)
+               END-IF
+           END-PERFORM
+           DISPLAY "----------------------".
+
+      *=================================================
+      *  END OF PROGRAM
+      *=================================================
